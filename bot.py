@@ -10,11 +10,14 @@ import os
 from datetime import date, datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
-from telegram.ext import (Application, CommandHandler, ContextTypes, ConversationHandler,
-                          MessageHandler, filters)
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
+                      ReplyKeyboardRemove, Update)
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          ConversationHandler, MessageHandler, filters)
 
 import db
+import explain
+import prompts
 import risk
 import weather
 
@@ -24,8 +27,11 @@ log = logging.getLogger("harvestly-bot")
 # httpx logs every Telegram request URL, and that URL contains the bot token. Keep it out of the logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-LANG, HARVEST, STORAGE, MOISTURE, METER, BAGS, NOTES = range(7)
+LANG, HARVEST, STORAGE, MOISTURE, METER, BAGS, SUBCOUNTY, NOTES = range(8)
 MAX_NOTE = 500   # characters kept (matches the farmer_notes column)
+SUB_COUNTIES = ["Ainabkoi", "Kapseret", "Kesses", "Moiben", "Soy", "Turbo"]   # Uasin Gishu
+MAX_SHOWN = 8    # /mybatches lists at most this many batches (Telegram messages are length-limited)
+ICON = {"low": "\U0001F7E2", "medium": "\U0001F7E1", "high": "\U0001F534"}   # green, yellow, red
 
 # ---------------------------------------------------------------------------
 # Words the bot says (a Swahili speaker should check the Swahili)
@@ -41,15 +47,20 @@ TEXT = {
         "bad_meter": "I could not read that. Type a number between 5 and 40, for example 14.5",
         "ask_bags": "How many bags (90 kg) do you have? Type a number.",
         "bad_bags": "Please type a whole number, for example 20.",
+        "ask_subcounty": "Which sub-county are you in? I use the weather near you.",
+        "other_place": "Another place",
         "ask_notes": ("Last question. Is there anything else we should know about this maize or how you "
                       "store it? For example pests, a leaking roof, or how you dried it. "
                       "Type it, or tap Skip."),
         "skip": "Skip",
         "notes_saved": "Thank you, I have noted that.",
         "saved": "Thank you. Your maize is registered. Here is your first check:",
-        "later": "I will message you if the risk changes. Send /status any time to see your batches.",
+        "later": "I will message you if the risk changes. Send /mybatches any time to see your batches.",
         "no_batches": "You have no maize registered yet. Send /start to add it.",
         "status_head": "Your maize batches:",
+        "mybatch": ("{icon} Batch {n}: {storage}\n   Harvested {harvest} ({days} days ago), {bags} bags\n"
+                    "   {level}: {why}"),
+        "mybatches_more": "Send /start to add more maize.",
         "status_line": "Batch {n}: {storage}, {days} days stored, {level}",
         "cancel": "Cancelled. Send /start to begin again.",
         "today": "Today", "yesterday": "Yesterday",
@@ -67,15 +78,20 @@ TEXT = {
         "bad_meter": "Sijaelewa. Andika namba kati ya 5 na 40, mfano 14.5",
         "ask_bags": "Una magunia mangapi (kilo 90)? Andika namba.",
         "bad_bags": "Tafadhali andika namba kamili, mfano 20.",
+        "ask_subcounty": "Uko kaunti ndogo gani? Ninatumia hali ya hewa karibu nawe.",
+        "other_place": "Mahali pengine",
         "ask_notes": ("Swali la mwisho. Je, kuna jambo lingine tunalopaswa kujua kuhusu mahindi haya au "
                       "jinsi unavyoyahifadhi? Mfano wadudu, paa linalovuja, au jinsi ulivyoyakausha. "
                       "Liandike, au bonyeza Ruka."),
         "skip": "Ruka",
         "notes_saved": "Asante, nimeliandika.",
         "saved": "Asante. Mahindi yako yamesajiliwa. Hii ndiyo ukaguzi wako wa kwanza:",
-        "later": "Nitakutumia ujumbe hatari ikibadilika. Tuma /status wakati wowote kuona mahindi yako.",
+        "later": "Nitakutumia ujumbe hatari ikibadilika. Tuma /mybatches wakati wowote kuona mahindi yako.",
         "no_batches": "Bado hujasajili mahindi. Tuma /start kuyaongeza.",
         "status_head": "Mahindi yako:",
+        "mybatch": ("{icon} Kundi {n}: {storage}\n   Lilivunwa {harvest} (siku {days} zilizopita), "
+                    "magunia {bags}\n   {level}: {why}"),
+        "mybatches_more": "Tuma /start kuongeza mahindi zaidi.",
         "status_line": "Kundi {n}: {storage}, siku {days}, {level}",
         "cancel": "Imeghairiwa. Tuma /start kuanza tena.",
         "today": "Leo", "yesterday": "Jana",
@@ -100,6 +116,34 @@ def lookup(lang, key, text, codes):
 
 def keyboard(rows):
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+
+
+def inline_keyboard(rows):
+    """Rows of (label, callback_data) -> Telegram tap buttons under a message."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=data) for label, data in row]
+                                 for row in rows])
+
+
+def prepare():
+    """Blocking. Load the team's editable thresholds, and return the simulator settings."""
+    try:
+        risk.apply_thresholds(db.get_thresholds())
+    except db.DBError:
+        risk.apply_thresholds(None)       # table not created yet: use the defaults in risk.py
+    return db.get_sim_settings()
+
+
+def assess_batch(storage_type, harvest_date, moisture_check, moisture_pct, sub_county, sim,
+                 vision_flag=None):
+    """Blocking. Score one batch now, with the weather of the farmer's sub-county."""
+    humidity, rain, temp_c, _ = weather.effective_weather(sim, sub_county)
+    days = (date.today() - harvest_date).days + int(sim.get("day_offset") or 0)
+    return risk.assess(storage_type, days, moisture_check, moisture_pct, humidity, rain, temp_c,
+                       vision_flag)
+
+
+def time_stamp():
+    return datetime.now(timezone(timedelta(hours=3))).strftime("%d %b %H:%M")
 
 
 def parse_harvest_date(text, lang):
@@ -140,6 +184,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def got_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = "sw" if "swa" in update.message.text.lower() else "en"
     context.user_data["lang"] = lang
+    try:     # only ask the sub-county if we do not know it yet
+        known = await asyncio.to_thread(db.get_farmer_by_chat, str(update.effective_chat.id))
+    except db.DBError:
+        known = None
+    context.user_data["ask_subcounty"] = not (known and known.get("sub_county"))
     await update.message.reply_text(
         t(lang, "ask_date"),
         reply_markup=keyboard([[t(lang, "today"), t(lang, "yesterday")]]))
@@ -202,13 +251,22 @@ async def got_meter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def register(chat_id, name, data):
-    """Blocking work: save the farmer and batch, then compute the first risk."""
+    """Blocking work: save the farmer and batch, then compute the first risk.
+
+    Returns (message, alert_batch_id). alert_batch_id is the batch id when this first check was also
+    logged as a warning (medium or high), so the bot can add the "was this useful?" buttons."""
     lang = data["lang"]
     farmer = db.get_farmer_by_chat(chat_id)
     if farmer is None:
         farmer = db.create_farmer(chat_id, name, language=lang)
     elif farmer.get("language") != lang:
         db.set_farmer_language(farmer["id"], lang)
+    sub_county = data.get("sub_county") or farmer.get("sub_county")
+    if data.get("sub_county") and data["sub_county"] != farmer.get("sub_county"):
+        try:
+            db.set_farmer_sub_county(farmer["id"], data["sub_county"])
+        except db.DBError as exc:
+            log.warning("could not save the sub-county: %s", exc)
     fields = dict(moisture_pct=data.get("moisture_pct"), moisture_source=data["moisture_source"],
                   bags=data["bags"])
     notes = data.get("notes")
@@ -222,23 +280,28 @@ def register(chat_id, name, data):
         log.warning("could not save the note, saving the batch without it")
         batch = db.create_batch(farmer["id"], data["harvest_date"], data["storage_type"],
                                 data["moisture_check"], **fields)
-    sim = db.get_sim_settings()
-    humidity, rain, temp_c, _ = weather.effective_weather(sim)
-    days = (date.today() - data["harvest_date"]).days + int(sim.get("day_offset") or 0)
-    a = risk.assess(data["storage_type"], days, data["moisture_check"], data.get("moisture_pct"),
-                    humidity, rain, temp_c)
+    sim = prepare()
+    a = assess_batch(data["storage_type"], data["harvest_date"], data["moisture_check"],
+                     data.get("moisture_pct"), sub_county, sim)
     db.save_risk(batch["id"], a.level, risk.reason_text(a, "en"))
-    stamp = datetime.now(timezone(timedelta(hours=3))).strftime("%d %b %H:%M")
-    message = risk.build_message(a, lang, stamp)
+    message = explain.final_message(a, lang, time_stamp())
+    alert_batch = None
     if a.level in ("medium", "high"):
         # This first check already warns the farmer. Log it and mark the batch, so the
         # scheduler does not send the very same warning again a few seconds later.
         try:
             db.log_alert(batch["id"], a.level, message)
             db.mark_alerted(batch["id"])
+            alert_batch = batch["id"]
         except db.DBError as exc:
             log.warning("could not log the first alert: %s", exc)
-    return message
+    return message, alert_batch
+
+
+async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = context.user_data["lang"]
+    await update.message.reply_text(t(lang, "ask_notes"), reply_markup=keyboard([[t(lang, "skip")]]))
+    return NOTES
 
 
 async def got_bags(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,9 +311,32 @@ async def got_bags(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(lang, "bad_bags"))
         return BAGS
     context.user_data["bags"] = int(text)
-    await update.message.reply_text(t(lang, "ask_notes"),
-                                    reply_markup=keyboard([[t(lang, "skip")]]))
-    return NOTES
+    if context.user_data.get("ask_subcounty"):
+        rows = [SUB_COUNTIES[i:i + 2] for i in range(0, len(SUB_COUNTIES), 2)] + [[t(lang, "other_place")]]
+        await update.message.reply_text(t(lang, "ask_subcounty"), reply_markup=keyboard(rows))
+        return SUBCOUNTY
+    return await ask_notes(update, context)
+
+
+async def got_subcounty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = context.user_data["lang"]
+    text = update.message.text.strip()
+    match = next((name for name in SUB_COUNTIES if name.lower() == text.lower()), None)
+    if match is None and text != t(lang, "other_place"):
+        await update.message.reply_text(t(lang, "bad_choice"))
+        return SUBCOUNTY
+    context.user_data["sub_county"] = match      # None = "another place": Eldoret weather is used
+    return await ask_notes(update, context)
+
+
+async def reply_with_feedback(chat, lang, text, alert_batch):
+    """Send `text`; when it was a logged warning, add the 'was this useful?' buttons under it."""
+    if alert_batch:
+        ask = prompts.FEEDBACK_ASK[lang if lang in prompts.FEEDBACK_ASK else "en"]
+        await chat.send_message(text + "\n\n" + ask,
+                                reply_markup=inline_keyboard(prompts.feedback_rows(alert_batch, lang)))
+    else:
+        await chat.send_message(text)
 
 
 async def got_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,7 +349,7 @@ async def got_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("OK", reply_markup=ReplyKeyboardRemove())
     try:
-        message = await asyncio.to_thread(
+        message, alert_batch = await asyncio.to_thread(
             register, str(update.effective_chat.id),
             update.effective_user.full_name if update.effective_user else "", context.user_data)
     except db.DBError as exc:
@@ -271,7 +357,7 @@ async def got_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, I could not save that right now. Please try /start again in a minute.")
         return ConversationHandler.END
     await update.message.reply_text(t(lang, "saved"))
-    await update.message.reply_text(message)
+    await reply_with_feedback(update.effective_chat, lang, message, alert_batch)
     await update.message.reply_text(t(lang, "later"))
     return ConversationHandler.END
 
@@ -283,33 +369,142 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /status
+# /mybatches  (and /status, the same thing)
 # ---------------------------------------------------------------------------
-def load_status(chat_id):
+def load_mybatches(chat_id):
+    """Blocking. Returns (language, [dict per batch]) with a fresh risk reading for each batch."""
     farmer = db.get_farmer_by_chat(chat_id)
     if farmer is None:
         return "en", []
-    return farmer.get("language") or "en", db.get_batches(farmer["id"])
+    lang = farmer.get("language") or "en"
+    batches = sorted(db.get_batches(farmer["id"]), key=lambda b: b.get("id") or 0)
+    if not batches:
+        return lang, []
+    sim = prepare()
+    total = len(batches)
+    shown = batches[-MAX_SHOWN:]
+    items = []
+    for number, batch in enumerate(shown, start=total - len(shown) + 1):
+        harvested = db.parse_date_str(batch.get("harvest_date"))
+        if harvested is None:
+            continue
+        a = assess_batch(batch.get("storage_type"), harvested, batch.get("moisture_check"),
+                         batch.get("moisture_pct"), farmer.get("sub_county"), sim, batch.get("vision_flag"))
+        items.append({"n": number, "storage_type": batch.get("storage_type"), "harvest": harvested,
+                      "days": (date.today() - harvested).days, "bags": batch.get("bags"), "a": a})
+    return lang, items
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def mybatches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        lang, batches = await asyncio.to_thread(load_status, str(update.effective_chat.id))
+        lang, items = await asyncio.to_thread(load_mybatches, str(update.effective_chat.id))
     except db.DBError as exc:
         log.error("database error: %s", exc)
         await update.message.reply_text("Sorry, I could not reach the database right now.")
         return
-    if not batches:
+    if not items:
         await update.message.reply_text(t(lang, "no_batches"))
         return
-    lines = [t(lang, "status_head")]
-    for number, batch in enumerate(batches, start=1):
-        harvested = db.parse_date_str(batch.get("harvest_date"))
-        days = (date.today() - harvested).days if harvested else "?"
-        level = risk.LABELS[lang].get(batch.get("risk_level") or "low", "")
-        lines.append(t(lang, "status_line").format(
-            n=number, storage=batch.get("storage_type") or "?", days=days, level=level))
-    await update.message.reply_text("\n".join(lines))
+    storage_labels = dict(zip(STORAGE_CODES, t(lang, "storage")))
+    blocks = [t(lang, "status_head")]
+    for item in items:
+        a = item["a"]
+        blocks.append(t(lang, "mybatch").format(
+            icon=ICON[a.level], n=item["n"], storage=storage_labels.get(item["storage_type"], "?"),
+            harvest=item["harvest"].isoformat(), days=item["days"],
+            bags=item["bags"] if item["bags"] is not None else "?",
+            level=risk.LABELS[lang][a.level], why=risk.reason_text(a, lang)))
+    blocks.append(t(lang, "mybatches_more"))
+    await update.message.reply_text("\n\n".join(blocks))
+
+
+# ---------------------------------------------------------------------------
+# Button taps: "was this warning useful?" (fb) and the moisture re-check (mc)
+# ---------------------------------------------------------------------------
+def own_batch(chat_id, batch_id):
+    """Blocking. (farmer, batch) if this batch belongs to the person who tapped, else (farmer, None)."""
+    farmer = db.get_farmer_by_chat(chat_id)
+    batch = db.get("batches", batch_id) if farmer else None
+    if batch is not None and batch.get("farmer_id") != farmer["id"]:
+        batch = None
+    return farmer, batch
+
+
+def handle_feedback(chat_id, batch_id, code):
+    """Blocking. Returns (language, [(text, alert_batch_or_None)])."""
+    farmer, batch = own_batch(chat_id, batch_id)
+    lang = (farmer or {}).get("language") or "en"
+    if batch is None or code not in prompts.FEEDBACK_VALUE:
+        return lang, []
+    db.save_alert_feedback(batch_id, prompts.FEEDBACK_VALUE[code])
+    return lang, [(prompts.FEEDBACK_THANKS[lang if lang in prompts.FEEDBACK_THANKS else "en"], None)]
+
+
+def handle_recheck(chat_id, batch_id, code):
+    """Blocking. Store the farmer's new moisture answer, re-score the batch, return the reply."""
+    farmer, batch = own_batch(chat_id, batch_id)
+    lang = (farmer or {}).get("language") or "en"
+    if batch is None or code not in prompts.RECHECK_VALUE:
+        return lang, []
+    db.apply_recheck(batch_id, prompts.RECHECK_VALUE[code])
+    batch = db.get("batches", batch_id) or batch
+    harvested = db.parse_date_str(batch.get("harvest_date"))
+    if harvested is None:
+        return lang, []
+    sim = prepare()
+    a = assess_batch(batch.get("storage_type"), harvested, batch.get("moisture_check"),
+                     batch.get("moisture_pct"), farmer.get("sub_county"), sim, batch.get("vision_flag"))
+    db.save_risk(batch_id, a.level, risk.reason_text(a, "en"))
+    message = explain.final_message(a, lang, time_stamp())
+    alert_batch = None
+    if a.level in ("medium", "high"):
+        try:
+            db.log_alert(batch_id, a.level, message)
+            db.mark_alerted(batch_id)
+            alert_batch = batch_id
+        except db.DBError as exc:
+            log.warning("could not log the re-check alert: %s", exc)
+    return lang, [(prompts.RECHECK_THANKS[lang if lang in prompts.RECHECK_THANKS else "en"], None),
+                  (message, alert_batch)]
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        kind, batch_text, code = (query.data or "").split(":")
+        batch_id = int(batch_text)
+    except ValueError:
+        await query.answer()
+        return
+    chat = update.effective_chat
+    work = handle_feedback if kind == "fb" else handle_recheck
+    try:
+        lang, replies = await asyncio.to_thread(work, str(chat.id), batch_id, code)
+    except db.DBError as exc:
+        log.error("database error on button %s: %s", kind, exc)
+        await query.answer("Sorry, please try again in a minute.", show_alert=True)
+        return
+    await query.answer()
+    if not replies:
+        return
+    try:                       # remove the buttons so one question is answered once
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001 - an old message can no longer be edited; that is fine
+        pass
+    for text, alert_batch in replies:
+        await reply_with_feedback(chat, lang, text, alert_batch)
+
+
+async def post_init(app):
+    """Fill the Telegram command menu (the button next to the typing box)."""
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Register maize / Sajili mahindi"),
+            BotCommand("mybatches", "My maize and its risk / Mahindi yangu"),
+            BotCommand("cancel", "Cancel / Ghairi"),
+        ])
+    except Exception as exc:  # noqa: BLE001 - the menu is a nicety, never a reason to stop
+        log.warning("could not set the command menu: %s", exc)
 
 
 def main():
@@ -320,6 +515,7 @@ def main():
     app = (Application.builder().token(token)
            .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
            .get_updates_connect_timeout(30).get_updates_read_timeout(30)
+           .post_init(post_init)
            .build())
     text_only = filters.TEXT & ~filters.COMMAND
     conversation = ConversationHandler(
@@ -331,12 +527,14 @@ def main():
             MOISTURE: [MessageHandler(text_only, got_moisture)],
             METER: [MessageHandler(text_only, got_meter)],
             BAGS: [MessageHandler(text_only, got_bags)],
+            SUBCOUNTY: [MessageHandler(text_only, got_subcounty)],
             NOTES: [MessageHandler(text_only, got_notes)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     app.add_handler(conversation)
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler(["mybatches", "status"], mybatches))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(fb|mc):\d+:[a-z]$"))
     log.info("Harvestly bot is running. Press Ctrl+C to stop.")
     app.run_polling(bootstrap_retries=-1)   # keep retrying until Telegram is reachable
 

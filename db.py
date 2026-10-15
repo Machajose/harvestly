@@ -40,9 +40,20 @@ def _request(method, url, what, **kwargs):
     return resp
 
 
+def _short(text):
+    """Make an error body readable: ORDS often answers with a whole HTML page."""
+    match = re.search(r"ORA-\d{5}[^<\r\n]*", text or "")
+    if match:                                    # the database's own message, e.g. ORA-02292
+        return match.group(0)[:300]
+    if "<html" in (text or "").lower():          # drop the page's style and tags, keep the words
+        text = re.sub(r"(?is)<style.*?</style>|<script.*?</script>", " ", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join((text or "").split())[:300]
+
+
 def _check(resp, what):
     if resp.status_code >= 400:
-        raise DBError(f"{what} failed: HTTP {resp.status_code} - {resp.text[:300]}")
+        raise DBError(f"{what} failed: HTTP {resp.status_code} - {_short(resp.text)}")
     return resp
 
 
@@ -207,6 +218,43 @@ def mark_alerted(batch_id):
 
 def log_alert(batch_id, level, message):
     return create("alerts", {"batch_id": batch_id, "risk_level": level, "message": message[:950]})
+
+
+def set_farmer_sub_county(farmer_id, sub_county):
+    return update("farmers", farmer_id, {"sub_county": (sub_county or "")[:40]})
+
+
+def get_thresholds():
+    """The editable risk numbers: {'HEAVY_RAIN_MM': 30, ...} from the risk_thresholds table.
+
+    Raises DBError if the table is missing or not REST-enabled (sql/features_upgrade.sql).
+    """
+    rows = find("risk_thresholds", all_pages=True)
+    return {row["name"]: row.get("value") for row in rows if row.get("name")}
+
+
+def save_alert_feedback(batch_id, value):
+    """Store the farmer's answer on the newest alert of this batch. Returns False if there is none."""
+    rows = find("alerts", {"batch_id": batch_id}, limit=1, order={"id": "desc"})
+    if not rows:
+        return False
+    update("alerts", rows[0]["id"], {"feedback": value, "feedback_at": now_iso()})
+    return True
+
+
+def mark_rechecked(batch_id):
+    return update("batches", batch_id, {"last_recheck_at": now_iso()})
+
+
+def apply_recheck(batch_id, moisture_check):
+    """The farmer re-checked the moisture by hand: store it, drop any older meter reading."""
+    changes = {"moisture_check": moisture_check, "moisture_pct": None,
+               "moisture_source": "field_check", "last_recheck_at": now_iso()}
+    try:
+        return update("batches", batch_id, changes)
+    except DBError:
+        changes.pop("last_recheck_at")      # the column may not exist yet (features_upgrade.sql)
+        return update("batches", batch_id, changes)
 
 
 def get_sim_settings():

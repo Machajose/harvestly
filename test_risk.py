@@ -42,6 +42,57 @@ for lang in ("en", "sw"):
         text = risk.build_message(a, lang, "14 Oct 09:00")
         assert risk.LABELS[lang][a.level] in text and "14 Oct 09:00" in text and len(text) > 80
 
+# ---- editable thresholds (risk_thresholds table), no database needed ----
+names, problem = risk.apply_thresholds({"HEAVY_RAIN_MM": 15})
+assert names == ["HEAVY_RAIN_MM"] and problem is None
+assert "rainy" in risk.assess("open_sack", 10, "dry", None, 60, 20, 18).codes     # 20 mm now counts as heavy
+names, problem = risk.apply_thresholds({"SAFE_MOISTURE": 30})                     # nonsense: above WET_MOISTURE
+assert names == [] and problem and risk.SAFE_MOISTURE == 13.5                     # ignored, defaults kept
+names, problem = risk.apply_thresholds({"HUMID": "abc"})
+assert names == [] and problem
+names, problem = risk.apply_thresholds({"NOT_A_THRESHOLD": 5})                    # unknown names are ignored
+assert names == [] and problem is None
+risk.apply_thresholds(None)                                                       # back to the defaults
+assert risk.HEAVY_RAIN_MM == 30.0 and "rainy" not in risk.assess("open_sack", 10, "dry", None, 60, 20, 18).codes
+
+# ---- message pieces, and the optional AI wording stays out of the way when switched off ----
+import os
+os.environ["GENAI_ENABLED"] = "false"
+import explain
+a = risk.assess("open_sack", 40, "unsure", None, 82, 35, 20)
+for lang in ("en", "sw"):
+    label, why, advice, source = risk.message_parts(a, lang, "14 Oct 09:00")
+    assert risk.build_message(a, lang, "14 Oct 09:00") == f"{label}\n{why}.\n\n{advice}\n\n{source}"
+    assert explain.final_message(a, lang, "14 Oct 09:00") == risk.build_message(a, lang, "14 Oct 09:00")
+assert explain.simplify("text 12", "en") == ("text 12", False)
+
+# ---- follow-up buttons ----
+import prompts
+for lang in ("en", "sw", "xx"):
+    for rows in (prompts.feedback_rows(123456789, lang), prompts.recheck_rows(123456789, lang)):
+        assert rows and all(len(row) == 1 and len(row[0][1].encode()) <= 64 for row in rows)
+assert {c for c in prompts.FEEDBACK_VALUE} == {r[0][1].split(":")[2] for r in prompts.feedback_rows(1, "en")}
+assert {c for c in prompts.RECHECK_VALUE} == {r[0][1].split(":")[2] for r in prompts.recheck_rows(1, "en")}
+assert "2026-10-09" in prompts.recheck_text("en", "2026-10-09")
+
+# ---- weather places ----
+import weather
+assert weather.place_key(" Soy ") == "soy" and weather.place_key("Nowhere") == "default" and weather.place_key(None) == "default"
+assert all(len(weather.coords_for(name)) == 2 for name in ("Soy", "Turbo", "Moiben", "Kesses", "Kapseret", "Ainabkoi", None))
+
+# ---- re-check reminder timing (no Telegram, no database) ----
+from datetime import datetime, timedelta
+import scheduler
+scheduler.RECHECK_DAYS = 3
+stamp = lambda days: (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+now = datetime.utcnow()
+assert scheduler.recheck_due({"id": 1, "moisture_check": "unsure", "created_at": stamp(5)}, now)
+assert not scheduler.recheck_due({"id": 2, "moisture_check": "unsure", "created_at": stamp(1)}, now)   # too soon
+assert not scheduler.recheck_due({"id": 3, "moisture_check": "dry", "created_at": stamp(9)}, now)      # already dry
+assert not scheduler.recheck_due({"id": 4, "moisture_check": "damp", "created_at": stamp(9),
+                                  "last_recheck_at": stamp(1)}, now)                                   # asked recently
+assert scheduler.recheck_due({"id": 5, "moisture_check": "dry", "moisture_pct": 18.0, "created_at": stamp(9)}, now)
+
 print("All risk tests passed")
 print()
 print("Example alert (English):")

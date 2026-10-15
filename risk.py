@@ -22,6 +22,57 @@ MEDIUM_SCORE = 3
 
 LEVEL_RANK = {"low": 0, "medium": 1, "high": 2}
 
+# ---- editable thresholds ---------------------------------------------------------
+# The numbers above are the DEFAULTS. The team can change them without touching code, in the
+# APEX "Risk thresholds" page (table risk_thresholds). The bot and scheduler call
+# apply_thresholds() with that table's rows. If the table is missing or a value is nonsense,
+# the defaults are used, so a typo in APEX can never break the bot.
+TUNABLE = ["SAFE_MOISTURE", "WET_MOISTURE", "HUMID", "VERY_HUMID", "HEAVY_RAIN_MM", "WARM_C",
+           "LONG_STORAGE_DAYS", "MEDIUM_STORAGE_DAYS", "HIGH_SCORE", "MEDIUM_SCORE"]
+DEFAULTS = {name: globals()[name] for name in TUNABLE}
+_SCORES = ("HIGH_SCORE", "MEDIUM_SCORE")
+
+
+def _check_thresholds(c):
+    """Return a problem description, or None if the set of numbers makes sense together."""
+    if any(v <= 0 for v in c.values()):
+        return "every threshold must be above 0"
+    if not c["SAFE_MOISTURE"] < c["WET_MOISTURE"] <= 100:
+        return "SAFE_MOISTURE must be below WET_MOISTURE (and at most 100)"
+    if not c["HUMID"] < c["VERY_HUMID"] <= 100:
+        return "HUMID must be below VERY_HUMID (and at most 100)"
+    if not c["MEDIUM_STORAGE_DAYS"] < c["LONG_STORAGE_DAYS"]:
+        return "MEDIUM_STORAGE_DAYS must be below LONG_STORAGE_DAYS"
+    if not c["MEDIUM_SCORE"] < c["HIGH_SCORE"]:
+        return "MEDIUM_SCORE must be below HIGH_SCORE"
+    return None
+
+
+def apply_thresholds(values=None):
+    """Use thresholds from the database. `values` is {NAME: number}. Unknown names are ignored.
+
+    Returns (names that now differ from the defaults, problem text or None).
+    On any problem NOTHING is changed from the defaults. apply_thresholds(None) resets to defaults.
+    """
+    candidate = dict(DEFAULTS)
+    problem = None
+    for name, raw in (values or {}).items():
+        key = str(name).strip().upper()
+        if key not in DEFAULTS:
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            problem = f"{key} is not a number: {raw!r}"
+            break
+        candidate[key] = int(round(number)) if key in _SCORES or key.endswith("_DAYS") else number
+    if problem is None:
+        problem = _check_thresholds(candidate)
+    if problem is not None:
+        candidate = dict(DEFAULTS)
+    globals().update(candidate)
+    return [k for k in TUNABLE if candidate[k] != DEFAULTS[k]], problem
+
 # ---- wording ---------------------------------------------------------------
 LABELS = {
     "en": {"high": "HIGH RISK", "medium": "MEDIUM RISK", "low": "LOW RISK"},
@@ -76,8 +127,8 @@ ADVICE = {
 }
 
 SOURCE_LINE = {
-    "en": "Based on your answers and Eldoret weather (Open-Meteo). Checked {t}.",
-    "sw": "Kulingana na majibu yako na hali ya hewa ya Eldoret (Open-Meteo). Imekaguliwa {t}.",
+    "en": "Based on your answers and the weather near you (Open-Meteo). Checked {t}.",
+    "sw": "Kulingana na majibu yako na hali ya hewa karibu nawe (Open-Meteo). Imekaguliwa {t}.",
 }
 
 
@@ -186,11 +237,16 @@ def advice_text(a, lang="en"):
     return ADVICE.get(lang, ADVICE["en"])[advice_key(a)]
 
 
-def build_message(a, lang="en", checked_at=""):
-    """The full alert: level, why, one action, and where the information came from."""
+def message_parts(a, lang="en", checked_at=""):
+    """The four pieces of an alert: (level label, reason sentence, action, source line)."""
     lang = lang if lang in LABELS else "en"
-    label = LABELS[lang][a.level]
     why = reason_text(a, lang)
     why = why[0].upper() + why[1:] if why else why
     source = SOURCE_LINE[lang].format(t=checked_at or "just now")
-    return f"{label}\n{why}.\n\n{advice_text(a, lang)}\n\n{source}"
+    return LABELS[lang][a.level], why, advice_text(a, lang), source
+
+
+def build_message(a, lang="en", checked_at=""):
+    """The full alert: level, why, one action, and where the information came from."""
+    label, why, advice, source = message_parts(a, lang, checked_at)
+    return f"{label}\n{why}.\n\n{advice}\n\n{source}"

@@ -2,4 +2,4 @@
 .venv/
 __pycache__/
 *.pyc
-weather_backup.json
+weather_backup*.json

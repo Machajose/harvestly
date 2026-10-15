@@ -58,7 +58,31 @@ def update_batch():
     assert row["risk_level"] == "medium", f"risk_level is {row['risk_level']!r}, expected 'medium'"
 
 
+def read_thresholds():
+    rows = db.get_thresholds()
+    assert rows, "the risk_thresholds table is empty (run sql/features_upgrade.sql)"
+    print(f"      ({len(rows)} thresholds, e.g. HEAVY_RAIN_MM = {rows.get('HEAVY_RAIN_MM')})")
+
+
+def new_columns():
+    """The feedback / re-check columns must exist, or those features cannot save anything."""
+    batch = db.get("batches", state["batch"]["id"])
+    db.mark_rechecked(state["batch"]["id"])
+    row = db.get("batches", state["batch"]["id"])
+    assert row.get("last_recheck_at"), "last_recheck_at did not save (run sql/features_upgrade.sql)"
+    alert = db.create("alerts", {"batch_id": batch["id"], "risk_level": "medium", "message": "check test"})
+    state["alert"] = alert
+    assert db.save_alert_feedback(batch["id"], "useful"), "no alert found to save feedback on"
+    back = db.get("alerts", alert["id"]) if alert.get("id") else None
+    assert back is None or back.get("feedback") == "useful", "feedback did not save (run sql/features_upgrade.sql)"
+
+
 def clean_up():
+    if state.get("batch"):
+        # Delete EVERY alert of the test batch first (a batch cannot be deleted while alerts point at it).
+        # We look them up instead of trusting an id from the earlier step, which ORDS may not return.
+        for alert in db.find("alerts", {"batch_id": state["batch"]["id"]}, all_pages=True):
+            db.delete("alerts", alert["id"])
     if state.get("batch"):
         db.delete("batches", state["batch"]["id"])
     if state.get("farmer"):
@@ -74,6 +98,9 @@ if state.get("farmer"):
     step("create a test batch", make_batch)
 if state.get("batch"):
     step("update the batch risk", update_batch)
+step("read the risk thresholds table (sql/features_upgrade.sql)", read_thresholds)
+if state.get("batch"):
+    step("save a re-check time and alert feedback (sql/features_upgrade.sql)", new_columns)
 step("delete the test rows", clean_up)
 
 print()
