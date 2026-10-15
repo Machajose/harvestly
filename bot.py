@@ -229,7 +229,16 @@ def register(chat_id, name, data):
                     humidity, rain, temp_c)
     db.save_risk(batch["id"], a.level, risk.reason_text(a, "en"))
     stamp = datetime.now(timezone(timedelta(hours=3))).strftime("%d %b %H:%M")
-    return risk.build_message(a, lang, stamp)
+    message = risk.build_message(a, lang, stamp)
+    if a.level in ("medium", "high"):
+        # This first check already warns the farmer. Log it and mark the batch, so the
+        # scheduler does not send the very same warning again a few seconds later.
+        try:
+            db.log_alert(batch["id"], a.level, message)
+            db.mark_alerted(batch["id"])
+        except db.DBError as exc:
+            log.warning("could not log the first alert: %s", exc)
+    return message
 
 
 async def got_bags(update: Update, context: ContextTypes.DEFAULT_TYPE):
